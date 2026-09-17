@@ -243,7 +243,9 @@ def run():
         buffer.add(row)
 
         # === ENHANCED FEATURES INTEGRATION ===
-        buffer_recent = buffer.last_n(11)
+        # The ring buffer already contains this minute's row, so the enhanced
+        # features can be computed from it directly and stored back in place.
+        buffer_recent = buffer.get_all()
         buffer_30m = buffer.last_n(30)
         enhanced = compute_derived_features(row, buffer_recent, buffer_30m, now_utc)
         for fname, fval in enhanced.items():
@@ -274,9 +276,13 @@ def run():
                 "is_day": float(_to_float(row.get("is_day"), 0.0) or 0.0),
                 "dP_30m_scaled": round(enhanced.get('dP_30m_scaled', 0), 3),
                 "dRH_30m_scaled": round(enhanced.get('dRH_30m_scaled', 0), 3),
+                "dSolar_10m_scaled": round(enhanced.get('dSolar_10m_scaled', 0), 3),
+                "spread_td_enh": round(enhanced.get('spread_td', 0), 3),
                 "pre_rain_index": round(enhanced.get('pre_rain_index', 0), 3),
                 "instability_index": round(enhanced.get('instability_index', 0), 3),
+                "pop_30m": forecasts.get("pop_30m"),
                 "pop_60m": forecasts.get("pop_60m"),
+                "pop_120m": forecasts.get("pop_120m"),
                 "p50_60m": forecasts.get("p50_60m"),
             }
             log.info(f"Debug features: {debug_features_payload}")
@@ -288,9 +294,8 @@ def run():
             if cfg.learning_enabled:
                 info = engine.train_from_buffer(
                     buffer.get_all(),
-                    horizons_min=(60, 120, 360),
+                    horizons_min=(30, 60, 120, 360),
                     threshold_mm=0.1,
-                    pos_weight=10.0,
                 )
                 last_training_result = f"updated={info.get('updated', 0)}"
                 log.info(f"Training: {info}")

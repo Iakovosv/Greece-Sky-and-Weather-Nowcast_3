@@ -10,6 +10,60 @@ from ml.persistence import load_state, atomic_save
 
 HORIZONS = (30, 60, 120, 360)
 
+# Leading-indicator features produced by core/features.py that are not already
+# part of the base feature vector. They are already scaled to roughly unit
+# magnitude, so mean=0 / std=1 normalization is correct for them.
+EXTRA_FEATURES = (
+    "rain_1m_mm",
+    "dP_10m_scaled",
+    "dRH_10m_scaled",
+    "dT_10m_scaled",
+    "dWind_10m_scaled",
+    "dSolar_10m_scaled",
+    "dP_30m_scaled",
+    "dRH_30m_scaled",
+    "dT_30m_scaled",
+    "p_mean_30m_scaled",
+    "rh_mean_30m_scaled",
+    "p_trend_30m",
+    "h_trend_30m",
+    "p_volatility_5m",
+    "dSpread_10m",
+    "pre_rain_index",
+    "instability_index",
+)
+
+# How far back a snapshot must be rain-free to count as a genuine pre-rain state.
+DRY_GUARD_MIN = 15
+
+# Physically-motivated initial weights for the pre-rain indicators.
+#
+# The base model puts zero weight on every trend feature, so on its own it can
+# only react once the air is already wet -- which is why rainfall was reported
+# 30-60 minutes after it had started. These priors encode the standard
+# pre-rainfall signature (pressure falling, humidity rising, solar dropping,
+# air saturating) so the first forecast is already useful; online learning then
+# refines them against local observations.
+PRIOR_W = {
+    # Rain persistence: the base model gives rainrate zero weight, so without
+    # this an ongoing shower produces a *lower* probability than the run-up to
+    # it, because the pre-rain trends flatten out once rain begins.
+    "rain_1m_mm": 3.00,
+    "rainrate": 0.05,
+    "dP_10m_scaled": -0.20,
+    "dP_30m_scaled": -0.35,
+    "dRH_10m_scaled": 0.25,
+    "dRH_30m_scaled": 0.45,
+    "dSolar_10m_scaled": -0.25,
+    "dT_30m_scaled": -0.10,
+    "p_trend_30m": -0.30,
+    "h_trend_30m": 0.30,
+    "p_volatility_5m": 0.15,
+    "dSpread_10m": -0.20,
+    "pre_rain_index": 0.90,
+    "instability_index": 0.35,
+}
+
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -35,8 +89,38 @@ class ModelEngine:
         self.log = logger
 
         self.base = BaseModel.load()
-        self.features = self.base.features
+        self.base_features = list(self.base.features)
+
+        # Extend the base feature vector with the pre-rain indicators. The base
+        # model has no weights for them, so they start at zero and are learned
+        # online from local pre-rain observations.
+        extras = [f for f in EXTRA_FEATURES if f not in self.base_features]
+        self.extra_features = extras
+        self.features = self.base_features + extras
+
+        for name in extras:
+            self.base.norm[name] = {"mean": 0.0, "std": 1.0}
+
+        # featurize() iterates over base.features, so it must see the extension too.
+        self.base.features = self.features
+
+        # Seed the pre-rain indicators with their physical prior so the very
+        # first forecast already looks ahead of the rain instead of waiting to
+        # observe it.
+        self.prior = np.array(
+            [PRIOR_W.get(f, 0.0) for f in self.features], dtype=float
+        )
+
+        # Only the locally-observed pre-rain indicators may be adapted online.
+        # The base coefficients come from a global fit and must not be moved by
+        # an hourly window of a few hundred autocorrelated minutes.
+        self.trainable = np.array(
+            [1.0 if f in self.extra_features else 0.0 for f in self.features],
+            dtype=float,
+        )
+
         self.base_version = self.base.version
+        self.n_base = len(self.base_features)
 
         self.trained_samples = 0
         self.last_training_info: Dict[str, Any] = {"updated": 0}
@@ -45,18 +129,44 @@ class ModelEngine:
 
         pop: Dict[int, Any] = {}
         q: Dict[int, Any] = {}
+        self._platt: Dict[int, Tuple[float, float]] = {}
 
-        for h in (60, 120, 360):
-            bm = self.base.pop_models[str(h)]
-            pop[h] = (np.array(bm["w"], dtype=float), float(bm["b"]))
+        for h in HORIZONS:
+            key = str(h)
+            if key in self.base.pop_models:
+                bm = self.base.pop_models[key]
+                w = self._pad(np.array(bm["w"], dtype=float))
+                b = float(bm["b"])
+                a = float(bm.get("platt_a", 1.0))
+                c = float(bm.get("platt_b", 0.0))
+            else:
+                # No base weights for this horizon (30m): start from the 60m
+                # model so the cold start is sane, then train it locally.
+                bm60 = self.base.pop_models["60"]
+                w = self._pad(np.array(bm60["w"], dtype=float))
+                b = float(bm60["b"])
+                a = float(bm60.get("platt_a", 1.0))
+                c = float(bm60.get("platt_b", 0.0))
+            w = w + self.prior
+            pop[h] = (w, b)
+            self._platt[h] = (a, c)
 
-            am = self.base.amount_models[str(h)]
+            am = self.base.amount_models.get(key)
+            if am is None:
+                am = self.base.amount_models["60"]
             q[h] = {}
             for qq in (0.1, 0.5, 0.9):
                 coeff = am[str(qq)]
-                q[h][qq] = (np.array(coeff["w"], dtype=float), float(coeff["b"]))
+                q[h][qq] = (self._pad(np.array(coeff["w"], dtype=float)), float(coeff["b"]))
 
         self.state = OnlineState(pop=pop, q=q, trained_samples=0)
+
+        # Replay memory. An hourly retrain that only sees the current 420-minute
+        # buffer is trained on a tiny, unrepresentative window: one wet hour can
+        # make every sample positive and the model swings between 0% and 100%.
+        # Keeping the recent labelled samples gives each retrain a stable,
+        # balanced view of local pre-rain conditions.
+        self.replay: Dict[int, Dict[str, List[Any]]] = {h: {"X": [], "amt": [], "pop": []} for h in HORIZONS}
 
         st = load_state()
         if st:
@@ -70,8 +180,18 @@ class ModelEngine:
 
         if self.log:
             self.log.info(
-                f"Loaded base model version={self.base_version} features={len(self.features)}"
+                f"Loaded base model version={self.base_version} "
+                f"features={len(self.base_features)}+{len(self.extra_features)}"
             )
+
+    def _pad(self, w: np.ndarray) -> np.ndarray:
+        """Match a coefficient vector to the current feature count."""
+        n = len(self.features)
+        if len(w) == n:
+            return w
+        out = np.zeros(n, dtype=float)
+        out[: min(len(w), n)] = w[: min(len(w), n)]
+        return out
 
     def _apply_persisted(self, st: Dict[str, Any]) -> None:
         if st.get("base_version") != self.base_version:
@@ -84,10 +204,10 @@ class ModelEngine:
 
         for h_str, wb in st.get("pop", {}).items():
             h = int(h_str)
-            w = np.array(wb.get("w", []), dtype=float)
-            b = float(wb.get("b", 0.0))
-            if h in self.state.pop and len(w) == len(self.features):
-                self.state.pop[h] = (w, b)
+            if h not in self.state.pop:
+                continue
+            w = self._pad(np.array(wb.get("w", []), dtype=float))
+            self.state.pop[h] = (w, float(wb.get("b", 0.0)))
 
         for h_str, qs in st.get("q", {}).items():
             h = int(h_str)
@@ -95,10 +215,20 @@ class ModelEngine:
                 continue
             for q_str, wb in qs.items():
                 qq = float(q_str)
-                w = np.array(wb.get("w", []), dtype=float)
-                b = float(wb.get("b", 0.0))
-                if qq in self.state.q[h] and len(w) == len(self.features):
-                    self.state.q[h][qq] = (w, b)
+                if qq not in self.state.q[h]:
+                    continue
+                w = self._pad(np.array(wb.get("w", []), dtype=float))
+                self.state.q[h][qq] = (w, float(wb.get("b", 0.0)))
+
+        for h_str, mem in (st.get("replay") or {}).items():
+            h = int(h_str)
+            if h not in self.replay:
+                continue
+            self.replay[h] = {
+                "X": list(mem.get("X", [])),
+                "amt": list(mem.get("amt", [])),
+                "pop": list(mem.get("pop", [])),
+            }
 
         self.state.trained_samples = int(st.get("trained_samples", 0))
         self.training_count_total = int(st.get("training_count_total", 0) or 0)
@@ -122,6 +252,12 @@ class ModelEngine:
             for qq, (w, b) in qs.items():
                 obj["q"][str(h)][str(qq)] = {"w": w.tolist(), "b": float(b)}
 
+        obj["replay"] = {
+            str(h): {"X": mem["X"], "amt": mem["amt"], "pop": mem["pop"]}
+            for h, mem in self.replay.items()
+            if mem["X"]
+        }
+
         atomic_save(obj)
 
     def infer(self, buffer: Any) -> Dict[str, float]:
@@ -135,67 +271,34 @@ class ModelEngine:
         x = self.base.featurize(last)
         out: Dict[str, float] = {}
 
-        p60 = self._infer_pop_local(x, 60)
-        p120 = self._infer_pop_local(x, 120)
-        p360 = self._infer_pop_local(x, 360)
+        pops = {h: self._infer_pop_local(x, h) for h in HORIZONS}
+        for h in HORIZONS:
+            out[f"pop_{h}m"] = round(100.0 * pops[h], 1)
 
-        out["pop_60m"] = round(100.0 * p60, 1)
-        out["pop_30m"] = round(100.0 * _clamp(p60 * 0.85, 0.0, 1.0), 1)
-        out["pop_120m"] = round(100.0 * p120, 1)
-        out["pop_360m"] = round(100.0 * p360, 1)
+        max_mm = {30: 30.0, 60: 50.0, 120: 80.0, 360: 120.0}
 
-        max_mm = {60: 50.0, 120: 80.0, 360: 120.0}
+        for h in HORIZONS:
+            q10, q50, q90 = self._infer_q_local(x, h, max_mm=max_mm[h])
 
-        q10_60, q50_60, q90_60 = self._infer_q_local(x, 60, max_mm=max_mm[60])
-        q10_120, q50_120, q90_120 = self._infer_q_local(x, 120, max_mm=max_mm[120])
-        q10_360, q50_360, q90_360 = self._infer_q_local(x, 360, max_mm=max_mm[360])
-
-        def gate(q: float, p: float) -> float:
-            g = float(_clamp((p - 0.02) / 0.08, 0.0, 1.0))
-            return q * g
-
-        q10_60, q50_60, q90_60 = gate(q10_60, p60), gate(q50_60, p60), gate(q90_60, p60)
-        q10_120, q50_120, q90_120 = gate(q10_120, p120), gate(q50_120, p120), gate(q90_120, p120)
-        q10_360, q50_360, q90_360 = gate(q10_360, p360), gate(q50_360, p360), gate(q90_360, p360)
-
-        out.update(
-            {
-                "p10_60m": round(q10_60, 3),
-                "p50_60m": round(q50_60, 3),
-                "p90_60m": round(q90_60, 3),
-                "p10_30m": round(_clamp(q10_60 * 0.7, 0.0, 30.0), 3),
-                "p50_30m": round(_clamp(q50_60 * 0.7, 0.0, 30.0), 3),
-                "p90_30m": round(_clamp(q90_60 * 0.7, 0.0, 30.0), 3),
-                "p10_120m": round(q10_120, 3),
-                "p50_120m": round(q50_120, 3),
-                "p90_120m": round(q90_120, 3),
-                "p10_360m": round(q10_360, 3),
-                "p50_360m": round(q50_360, 3),
-                "p90_360m": round(q90_360, 3),
-            }
-        )
+            # If PoP is tiny, amounts should be ~0. This prevents "p50 huge / pop 0%".
+            g = float(_clamp((pops[h] - 0.02) / 0.08, 0.0, 1.0))
+            out[f"p10_{h}m"] = round(q10 * g, 3)
+            out[f"p50_{h}m"] = round(q50 * g, 3)
+            out[f"p90_{h}m"] = round(q90 * g, 3)
 
         return out
 
-    def _infer_pop_local(self, x, h):
+    def _infer_pop_local(self, x: np.ndarray, h: int) -> float:
         w, b = self.state.pop[h]
         raw_logit = float(x @ w + b)
 
-        bm = self.base.pop_models[str(h)]
-        a = float(bm.get("platt_a", 1.0))
-        c = float(bm.get("platt_b", 0.0))
-
-        z = a * raw_logit + c
-        
-        # Calibration for class imbalance (38:1)
-        z = z + np.log(2.5)
-        
-        p = _sigmoid_stable(z)
+        a, c = self._platt.get(h, (1.0, 0.0))
+        p = _sigmoid_stable(a * raw_logit + c)
         if not np.isfinite(p):
             p = 0.0
         return float(_clamp(p, 0.0, 1.0))
 
-    def _infer_q_local(self, x, h, max_mm) -> Tuple[float, float, float]:
+    def _infer_q_local(self, x: np.ndarray, h: int, max_mm: float) -> Tuple[float, float, float]:
         qs: Dict[float, float] = {}
 
         for qq, (w, b) in self.state.q[h].items():
@@ -212,41 +315,138 @@ class ModelEngine:
 
         return q10, q50, q90
 
-    def train_from_buffer(
+    def _build_batch(
         self,
         buffer_rows: List[Dict[str, Any]],
-        horizons_min=(60, 120, 360),
-        threshold_mm=0.1,
-        pos_weight=10.0,
-    ) -> Dict[str, Any]:
+        horizons_min,
+        threshold_mm: float,
+        max_samples: int,
+    ) -> Dict[int, Any]:
+        """Build training samples for a genuinely pre-rain framing.
+
+        For each dry snapshot at time t the label is the rain that falls in
+        (t, t+h]. Only snapshots whose preceding DRY_GUARD_MIN minutes were also
+        rain-free are used, so the model learns what the atmosphere looks like
+        *before* rain rather than during it.
+        """
+        n = len(buffer_rows)
         batch: Dict[int, Any] = {}
 
         for h in horizons_min:
-            if len(buffer_rows) < h + 2:
+            if n < h + DRY_GUARD_MIN + 1:
                 continue
 
-            snap = buffer_rows[-(h + 1)]
-            window = buffer_rows[-h:]
+            X: List[List[float]] = []
+            amt: List[float] = []
+            pop: List[float] = []
 
-            amt = float(sum(float(r.get("rain_1m_mm", 0.0) or 0.0) for r in window))
-            pop = 1.0 if amt > threshold_mm else 0.0
+            last_snap = n - h - 1
+            for snap_idx in range(DRY_GUARD_MIN - 1, last_snap + 1):
+                window = buffer_rows[snap_idx + 1: snap_idx + 1 + h]
+                if len(window) < h:
+                    continue
 
-            x = self.base.featurize(snap)
+                total = float(sum(float(r.get("rain_1m_mm", 0.0) or 0.0) for r in window))
+                X.append(self.base.featurize(buffer_rows[snap_idx]).tolist())
+                amt.append(total)
+                pop.append(1.0 if total > threshold_mm else 0.0)
 
-            batch.setdefault(h, {"X": [], "amt": [], "pop": []})
-            batch[h]["X"].append(x.tolist())
-            batch[h]["amt"].append(amt)
-            batch[h]["pop"].append(pop)
+                # `wet_now` is not filtered out: the model needs to learn both
+                # the pre-rain signature and rain persistence. Dropping wet
+                # snapshots taught it that rain lowers the probability.
 
-        if not batch:
+            if not X:
+                continue
+
+            # Keep the most recent samples and thin them out: consecutive minutes
+            # are strongly autocorrelated and add little information.
+            if len(X) > max_samples:
+                X = X[-max_samples:]
+                amt = amt[-max_samples:]
+                pop = pop[-max_samples:]
+
+            if len(X) > 30:
+                X = X[::2]
+                amt = amt[::2]
+                pop = pop[::2]
+
+            batch[h] = {"X": X, "amt": amt, "pop": pop}
+
+        return batch
+
+    def _update_replay(self, batch: Dict[int, Any], max_replay: int) -> None:
+        """Append the newest labelled samples to the replay memory."""
+        for h, data in batch.items():
+            if h not in self.replay:
+                self.replay[h] = {"X": [], "amt": [], "pop": []}
+            mem = self.replay[h]
+            mem["X"].extend(data["X"])
+            mem["amt"].extend(data["amt"])
+            mem["pop"].extend(data["pop"])
+            if len(mem["X"]) > max_replay:
+                keep = mem["X"][-max_replay:]
+                mem["X"] = keep
+                mem["amt"] = mem["amt"][-max_replay:]
+                mem["pop"] = mem["pop"][-max_replay:]
+
+    def _balanced(self, data: Dict[str, Any], max_total: int) -> Dict[str, Any]:
+        """Subsample so the positive class is neither drowned nor dominant."""
+        X = data["X"]
+        pop = data["pop"]
+        amt = data["amt"]
+
+        pos = [i for i, p in enumerate(pop) if p > 0.5]
+        neg = [i for i, p in enumerate(pop) if p <= 0.5]
+        if not pos or not neg:
+            return data
+
+        # Aim for roughly one positive per three negatives.
+        n_pos = min(len(pos), max(1, max_total // 4))
+        n_neg = min(len(neg), max_total - n_pos)
+
+        idx = pos[-n_pos:] + neg[-n_neg:]
+        idx.sort()
+        return {"X": [X[i] for i in idx], "amt": [amt[i] for i in idx], "pop": [pop[i] for i in idx]}
+
+    def train_from_buffer(
+        self,
+        buffer_rows: List[Dict[str, Any]],
+        horizons_min=HORIZONS,
+        threshold_mm=0.1,
+        pos_weight: float = 6.0,
+        epochs: int = 25,
+        max_samples: int = 240,
+        max_replay: int = 900,
+    ) -> Dict[str, Any]:
+        fresh = self._build_batch(buffer_rows, horizons_min, threshold_mm, max_samples)
+
+        if not fresh:
             return {"updated": 0, "reason": "not_enough_history"}
 
-        info = apply_training(self.state, batch, lr_pop=0.01, lr_q=0.01, l2=8.0, pos_weight=pos_weight)
+        self._update_replay(fresh, max_replay)
+
+        batch = {
+            h: self._balanced(mem, max_samples)
+            for h, mem in self.replay.items()
+            if mem["X"]
+        }
+
+        info = apply_training(
+            self.state,
+            batch,
+            lr_pop=0.02,
+            lr_q=0.02,
+            l2=1e-3,
+            pos_weight=pos_weight,
+            epochs=epochs,
+            trainable=self.trainable,
+        )
 
         updated = int(info.get("updated", 0) or 0)
         if updated > 0:
             self.training_count_total += 1
             from datetime import datetime as _dt
+
             self.last_training_ts = _dt.utcnow().isoformat()
 
         self.last_training_info = info
