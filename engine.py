@@ -389,6 +389,45 @@ class ModelEngine:
                 mem["amt"] = mem["amt"][-max_replay:]
                 mem["pop"] = mem["pop"][-max_replay:]
 
+    def _refit_platt(self, min_samples: int = 80) -> None:
+        """Re-calibrate the probability scale against the replay memory.
+
+        The base model's Platt coefficients were fitted on a different climate
+        and are never updated. Locally the raw logits came out systematically
+        under-confident (predicted 0.24 where 0.82 of the minutes were wet), so
+        the reported probability was not usable as a real likelihood. The replay
+        memory already holds labelled (logit, label) pairs, so refit a/c here.
+
+        Deliberately conservative: monotonic (a > 0), bounded, and only applied
+        once there is enough independent evidence.
+        """
+        for h, mem in self.replay.items():
+            labels = np.asarray(mem["pop"], dtype=float)
+            if len(labels) < min_samples or labels.min() == labels.max():
+                continue
+            X = np.asarray(mem["X"], dtype=float)
+            w, b = self.state.pop[h]
+            logits = X @ w + b
+            sd = float(np.std(logits))
+            if not np.isfinite(sd) or sd < 1e-6:
+                continue
+            z = (logits - float(np.mean(logits))) / sd
+
+            a, c = 1.0, 0.0
+            for _ in range(60):
+                pr = 1.0 / (1.0 + np.exp(-(a * z + c)))
+                g = pr - labels
+                ga = float(np.mean(g * z)) + 1e-3 * a
+                gc = float(np.mean(g))
+                a -= 0.5 * ga
+                c -= 0.5 * gc
+                a = float(_clamp(a, 0.05, 8.0))
+                c = float(_clamp(c, -8.0, 8.0))
+            if not (np.isfinite(a) and np.isfinite(c)):
+                continue
+            # store in the same (logit) space the inference path expects
+            self._platt[h] = (a / sd, c - a * float(np.mean(logits)) / sd)
+
     def _balanced(self, data: Dict[str, Any], max_total: int) -> Dict[str, Any]:
         """Subsample so the positive class is neither drowned nor dominant."""
         X = data["X"]
@@ -444,6 +483,7 @@ class ModelEngine:
 
         updated = int(info.get("updated", 0) or 0)
         if updated > 0:
+            self._refit_platt()
             self.training_count_total += 1
             from datetime import datetime as _dt
 
